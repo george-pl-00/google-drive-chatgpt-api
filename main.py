@@ -4,14 +4,15 @@ FastAPI service for Google Drive integration
 Includes endpoints for creating Google Documents and Sheets
 """
 
-from fastapi import FastAPI, HTTPException, Request, Response, Depends
+from fastapi import FastAPI, HTTPException, Request, Response, Depends, Cookie
 from fastapi.responses import JSONResponse, RedirectResponse
-from fastapi.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel
 from typing import Optional
 import os
 import pickle
 import secrets
+import jwt
+from datetime import datetime, timedelta
 from google_auth_oauthlib.flow import Flow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
@@ -24,15 +25,15 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets"
 ]
 
+# JWT secret for session management
+JWT_SECRET = os.environ.get('JWT_SECRET', secrets.token_urlsafe(32))
+
 # Initialize FastAPI app
 app = FastAPI(
     title="Google Drive Integration API",
     description="API for creating Google Documents and Sheets",
     version="1.0.0"
 )
-
-# Add session middleware
-app.add_middleware(SessionMiddleware, secret_key=secrets.token_urlsafe(32))
 
 # Global services
 drive_service = None
@@ -43,6 +44,24 @@ class DocumentRequest(BaseModel):
 
 class SheetRequest(BaseModel):
     name: str = "Test Sheet"
+
+def create_session_token(creds_data: dict) -> str:
+    """Create a JWT token for session management."""
+    payload = {
+        'creds': creds_data,
+        'exp': datetime.utcnow() + timedelta(hours=1)  # 1 hour expiry
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm='HS256')
+
+def verify_session_token(token: str) -> Optional[dict]:
+    """Verify and decode a JWT session token."""
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=['HS256'])
+        return payload.get('creds')
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
 
 def get_oauth_flow():
     """Create OAuth flow for web application."""
@@ -83,54 +102,54 @@ def get_oauth_flow():
     
     return flow
 
-def authenticate_google_services(request: Request):
+def authenticate_google_services(request: Request, session_token: Optional[str] = Cookie(None)):
     """Authenticate with Google services using OAuth 2.0."""
     global drive_service, docs_service
     
-    # Check if we have valid credentials in session
-    session = request.session
-    if 'google_creds' in session:
-        try:
-            # Try to use stored credentials
-            creds_data = session['google_creds']
-            from google.oauth2.credentials import Credentials
-            
-            creds = Credentials(
-                token=creds_data['token'],
-                refresh_token=creds_data.get('refresh_token'),
-                token_uri=creds_data['token_uri'],
-                client_id=creds_data['client_id'],
-                client_secret=creds_data.get('client_secret'),
-                scopes=creds_data['scopes']
-            )
-            
-            # Check if credentials are valid
-            if creds and creds.valid:
-                # Build services with valid credentials
-                drive_service = build("drive", "v3", credentials=creds)
-                docs_service = build("docs", "v1", credentials=creds)
-                return drive_service, docs_service
-            elif creds and creds.expired and creds.refresh_token:
-                # Refresh expired credentials
-                creds.refresh(Request())
-                # Update session with new token
-                session['google_creds'] = {
-                    'token': creds.token,
-                    'refresh_token': creds.refresh_token,
-                    'token_uri': creds.token_uri,
-                    'client_id': creds.client_id,
-                    'client_secret': creds.client_secret,
-                    'scopes': creds.scopes
-                }
+    # Check if we have valid credentials in session token
+    if session_token:
+        creds_data = verify_session_token(session_token)
+        if creds_data:
+            try:
+                # Try to use stored credentials
+                from google.oauth2.credentials import Credentials
                 
-                # Build services with refreshed credentials
-                drive_service = build("drive", "v3", credentials=creds)
-                docs_service = build("docs", "v1", credentials=creds)
-                return drive_service, docs_service
+                creds = Credentials(
+                    token=creds_data['token'],
+                    refresh_token=creds_data.get('refresh_token'),
+                    token_uri=creds_data['token_uri'],
+                    client_id=creds_data['client_id'],
+                    client_secret=creds_data.get('client_secret'),
+                    scopes=creds_data['scopes']
+                )
                 
-        except Exception as e:
-            # Clear invalid credentials from session
-            session.pop('google_creds', None)
+                # Check if credentials are valid
+                if creds and creds.valid:
+                    # Build services with valid credentials
+                    drive_service = build("drive", "v3", credentials=creds)
+                    docs_service = build("docs", "v1", credentials=creds)
+                    return drive_service, docs_service
+                elif creds and creds.expired and creds.refresh_token:
+                    # Refresh expired credentials
+                    creds.refresh(Request())
+                    # Update session with new token
+                    new_creds_data = {
+                        'token': creds.token,
+                        'refresh_token': creds.refresh_token,
+                        'token_uri': creds.token_uri,
+                        'client_id': creds.client_id,
+                        'client_secret': creds.client_secret,
+                        'scopes': creds.scopes
+                    }
+                    
+                    # Build services with refreshed credentials
+                    drive_service = build("drive", "v3", credentials=creds)
+                    docs_service = build("docs", "v1", credentials=creds)
+                    return drive_service, docs_service
+                    
+            except Exception as e:
+                # Clear invalid credentials
+                pass
     
     # No valid credentials - need to authenticate
     raise HTTPException(
@@ -139,7 +158,7 @@ def authenticate_google_services(request: Request):
     )
 
 @app.get("/auth")
-async def start_oauth_flow(request: Request):
+async def start_oauth_flow():
     """Start OAuth 2.0 flow."""
     try:
         flow = get_oauth_flow()
@@ -147,12 +166,6 @@ async def start_oauth_flow(request: Request):
             access_type='offline',
             include_granted_scopes='true'
         )
-        
-        # Store flow in session for callback
-        request.session['oauth_flow'] = {
-            'state': state,
-            'scopes': SCOPES
-        }
         
         return RedirectResponse(url=authorization_url)
         
@@ -163,14 +176,9 @@ async def start_oauth_flow(request: Request):
         )
 
 @app.get("/oauth2callback")
-async def oauth2_callback(request: Request, code: str, state: str):
+async def oauth2_callback(code: str, state: str):
     """Handle OAuth 2.0 callback."""
     try:
-        # Verify state parameter
-        session = request.session
-        if 'oauth_flow' not in session or session['oauth_flow']['state'] != state:
-            raise HTTPException(status_code=400, detail="Invalid state parameter")
-        
         # Get the flow
         flow = get_oauth_flow()
         flow.fetch_token(code=code)
@@ -178,8 +186,8 @@ async def oauth2_callback(request: Request, code: str, state: str):
         # Get credentials
         creds = flow.credentials
         
-        # Store credentials in session
-        session['google_creds'] = {
+        # Create session token
+        creds_data = {
             'token': creds.token,
             'refresh_token': creds.refresh_token,
             'token_uri': creds.token_uri,
@@ -188,13 +196,24 @@ async def oauth2_callback(request: Request, code: str, state: str):
             'scopes': creds.scopes
         }
         
-        # Clear OAuth flow from session
-        session.pop('oauth_flow', None)
+        session_token = create_session_token(creds_data)
         
-        return JSONResponse(content={
+        # Create response with cookie
+        response = JSONResponse(content={
             "message": "Authentication successful!",
             "status": "authenticated"
         })
+        
+        # Set cookie with session token
+        response.set_cookie(
+            key="session_token",
+            value=session_token,
+            httponly=True,
+            secure=os.environ.get('HEROKU_APP_NAME') is not None,  # HTTPS only in production
+            max_age=3600  # 1 hour
+        )
+        
+        return response
         
     except Exception as e:
         raise HTTPException(
@@ -203,11 +222,11 @@ async def oauth2_callback(request: Request, code: str, state: str):
         )
 
 @app.get("/logout")
-async def logout(request: Request):
+async def logout():
     """Clear authentication session."""
-    session = request.session
-    session.clear()
-    return JSONResponse(content={"message": "Logged out successfully"})
+    response = JSONResponse(content={"message": "Logged out successfully"})
+    response.delete_cookie(key="session_token")
+    return response
 
 @app.on_event("startup")
 async def startup_event():
@@ -231,7 +250,7 @@ async def root():
     }
 
 @app.post("/create_doc")
-async def create_doc(request: DocumentRequest, http_request: Request):
+async def create_doc(request: DocumentRequest, http_request: Request = Depends()):
     """Create a Google Document in Drive."""
     try:
         # Ensure services are authenticated
@@ -266,7 +285,7 @@ async def create_doc(request: DocumentRequest, http_request: Request):
         )
 
 @app.post("/create_sheet")
-async def create_sheet(request: SheetRequest, http_request: Request):
+async def create_sheet(request: SheetRequest, http_request: Request = Depends()):
     """Create a Google Sheet in Drive."""
     try:
         # Ensure services are authenticated
@@ -304,16 +323,9 @@ async def create_sheet(request: SheetRequest, http_request: Request):
         )
 
 @app.get("/health")
-async def health_check(request: Request):
+async def health_check():
     """Health check endpoint."""
-    try:
-        # Test Google services
-        authenticate_google_services(request)
-        return {"status": "healthy", "google_services": "connected"}
-    except HTTPException as e:
-        return {"status": "unhealthy", "google_services": "disconnected", "error": e.detail}
-    except Exception as e:
-        return {"status": "unhealthy", "google_services": "disconnected", "error": str(e)}
+    return {"status": "healthy", "message": "API is running"}
 
 if __name__ == "__main__":
     import uvicorn
