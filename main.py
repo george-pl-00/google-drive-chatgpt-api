@@ -57,24 +57,24 @@ def authenticate_google_services():
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            # Check if we're in Railway (production) or local
-            if os.environ.get('RAILWAY_ENVIRONMENT'):
-                # Railway deployment - use environment variables
+            # Check if we're in production (Heroku/Railway) or local
+            if os.environ.get('RAILWAY_ENVIRONMENT') or os.environ.get('HEROKU_APP_NAME'):
+                # Production deployment - use environment variables
                 client_id = os.environ.get('GOOGLE_OAUTH_CLIENT_ID')
                 client_secret = os.environ.get('GOOGLE_OAUTH_CLIENT_SECRET')
                 
                 if not client_id or not client_secret:
                     raise HTTPException(
                         status_code=500,
-                        detail="Missing Google OAuth environment variables in Railway"
+                        detail="Missing Google OAuth environment variables"
                     )
                 
-                # For Railway, we'll need to handle OAuth differently
+                # For production deployment, we'll need to handle OAuth differently
                 # This is a simplified approach - you may need to implement
                 # a proper OAuth flow for production
                 raise HTTPException(
                     status_code=500,
-                    detail="OAuth flow not yet implemented for Railway deployment"
+                    detail="OAuth flow not yet implemented for production deployment"
                 )
             else:
                 # Local development - use oauth_credentials.json
