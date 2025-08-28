@@ -4,15 +4,18 @@ FastAPI service for Google Drive integration
 Includes endpoints for creating Google Documents and Sheets
 """
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request, Response, Depends
+from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel
 from typing import Optional
 import os
 import pickle
-from google_auth_oauthlib.flow import InstalledAppFlow
+import secrets
+from google_auth_oauthlib.flow import Flow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
+import json
 
 # OAuth 2.0 scopes
 SCOPES = [
@@ -28,6 +31,9 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# Add session middleware
+app.add_middleware(SessionMiddleware, secret_key=secrets.token_urlsafe(32))
+
 # Global services
 drive_service = None
 docs_service = None
@@ -38,87 +44,176 @@ class DocumentRequest(BaseModel):
 class SheetRequest(BaseModel):
     name: str = "Test Sheet"
 
-def authenticate_google_services():
+def get_oauth_flow():
+    """Create OAuth flow for web application."""
+    # Check if we're in production (Heroku) or local
+    if os.environ.get('HEROKU_APP_NAME'):
+        # Production - use environment variables
+        client_id = os.environ.get('GOOGLE_OAUTH_CLIENT_ID')
+        client_secret = os.environ.get('GOOGLE_OAUTH_CLIENT_SECRET')
+        redirect_uri = f"https://{os.environ.get('HEROKU_APP_NAME')}.herokuapp.com/oauth2callback"
+        
+        # Create flow with production credentials
+        flow = Flow.from_client_config(
+            {
+                "web": {
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "redirect_uris": [redirect_uri]
+                }
+            },
+            SCOPES,
+            redirect_uri=redirect_uri
+        )
+    else:
+        # Local development - use oauth_credentials.json
+        if not os.path.exists('oauth_credentials.json'):
+            raise HTTPException(
+                status_code=500, 
+                detail="oauth_credentials.json not found! Please ensure you have the OAuth credentials file."
+            )
+        
+        flow = Flow.from_client_secrets_file(
+            'oauth_credentials.json', 
+            SCOPES,
+            redirect_uri='http://localhost:3333/oauth2callback'
+        )
+    
+    return flow
+
+def authenticate_google_services(request: Request):
     """Authenticate with Google services using OAuth 2.0."""
     global drive_service, docs_service
     
-    if drive_service and docs_service:
-        return drive_service, docs_service
-    
-    creds = None
-    
-    # Check if we have valid credentials
-    if os.path.exists('token.pickle'):
-        with open('token.pickle', 'rb') as token:
-            creds = pickle.load(token)
-    
-    # If no valid credentials available, let the user log in
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            # Check if we're in production (Heroku/Railway) or local
-            if os.environ.get('RAILWAY_ENVIRONMENT') or os.environ.get('HEROKU_APP_NAME'):
-                # Production deployment - use environment variables
-                client_id = os.environ.get('GOOGLE_OAUTH_CLIENT_ID')
-                client_secret = os.environ.get('GOOGLE_OAUTH_CLIENT_SECRET')
+    # Check if we have valid credentials in session
+    session = request.session
+    if 'google_creds' in session:
+        try:
+            # Try to use stored credentials
+            creds_data = session['google_creds']
+            from google.oauth2.credentials import Credentials
+            
+            creds = Credentials(
+                token=creds_data['token'],
+                refresh_token=creds_data.get('refresh_token'),
+                token_uri=creds_data['token_uri'],
+                client_id=creds_data['client_id'],
+                client_secret=creds_data.get('client_secret'),
+                scopes=creds_data['scopes']
+            )
+            
+            # Check if credentials are valid
+            if creds and creds.valid:
+                # Build services with valid credentials
+                drive_service = build("drive", "v3", credentials=creds)
+                docs_service = build("docs", "v1", credentials=creds)
+                return drive_service, docs_service
+            elif creds and creds.expired and creds.refresh_token:
+                # Refresh expired credentials
+                creds.refresh(Request())
+                # Update session with new token
+                session['google_creds'] = {
+                    'token': creds.token,
+                    'refresh_token': creds.refresh_token,
+                    'token_uri': creds.token_uri,
+                    'client_id': creds.client_id,
+                    'client_secret': creds.client_secret,
+                    'scopes': creds.scopes
+                }
                 
-                if not client_id or not client_secret:
-                    raise HTTPException(
-                        status_code=500,
-                        detail="Missing Google OAuth environment variables"
-                    )
+                # Build services with refreshed credentials
+                drive_service = build("drive", "v3", credentials=creds)
+                docs_service = build("docs", "v1", credentials=creds)
+                return drive_service, docs_service
                 
-                # For production deployment, we'll need to handle OAuth differently
-                # This is a simplified approach - you may need to implement
-                # a proper OAuth flow for production
-                raise HTTPException(
-                    status_code=500,
-                    detail="OAuth flow not yet implemented for production deployment"
-                )
-            else:
-                # Local development - use oauth_credentials.json
-                if not os.path.exists('oauth_credentials.json'):
-                    raise HTTPException(
-                        status_code=500, 
-                        detail="oauth_credentials.json not found! Please ensure you have the OAuth credentials file."
-                    )
-                
-                try:
-                    # Use InstalledAppFlow for local development
-                    flow = InstalledAppFlow.from_client_secrets_file(
-                        'oauth_credentials.json', SCOPES)
-                    creds = flow.run_local_server(port=0)
-                    
-                    # Save the credentials for the next run
-                    with open('token.pickle', 'wb') as token:
-                        pickle.dump(creds, token)
-                    
-                except Exception as e:
-                    raise HTTPException(
-                        status_code=500, 
-                        detail=f"OAuth authentication failed: {str(e)}"
-                    )
+        except Exception as e:
+            # Clear invalid credentials from session
+            session.pop('google_creds', None)
     
-    # Build services
+    # No valid credentials - need to authenticate
+    raise HTTPException(
+        status_code=401,
+        detail="Google authentication required. Please visit /auth to authenticate."
+    )
+
+@app.get("/auth")
+async def start_oauth_flow(request: Request):
+    """Start OAuth 2.0 flow."""
     try:
-        drive_service = build("drive", "v3", credentials=creds)
-        docs_service = build("docs", "v1", credentials=creds)
-        return drive_service, docs_service
+        flow = get_oauth_flow()
+        authorization_url, state = flow.authorization_url(
+            access_type='offline',
+            include_granted_scopes='true'
+        )
+        
+        # Store flow in session for callback
+        request.session['oauth_flow'] = {
+            'state': state,
+            'scopes': SCOPES
+        }
+        
+        return RedirectResponse(url=authorization_url)
+        
     except Exception as e:
         raise HTTPException(
-            status_code=500, 
-            detail=f"Error building services: {str(e)}"
+            status_code=500,
+            detail=f"Failed to start OAuth flow: {str(e)}"
         )
+
+@app.get("/oauth2callback")
+async def oauth2_callback(request: Request, code: str, state: str):
+    """Handle OAuth 2.0 callback."""
+    try:
+        # Verify state parameter
+        session = request.session
+        if 'oauth_flow' not in session or session['oauth_flow']['state'] != state:
+            raise HTTPException(status_code=400, detail="Invalid state parameter")
+        
+        # Get the flow
+        flow = get_oauth_flow()
+        flow.fetch_token(code=code)
+        
+        # Get credentials
+        creds = flow.credentials
+        
+        # Store credentials in session
+        session['google_creds'] = {
+            'token': creds.token,
+            'refresh_token': creds.refresh_token,
+            'token_uri': creds.token_uri,
+            'client_id': creds.client_id,
+            'client_secret': creds.client_secret,
+            'scopes': creds.scopes
+        }
+        
+        # Clear OAuth flow from session
+        session.pop('oauth_flow', None)
+        
+        return JSONResponse(content={
+            "message": "Authentication successful!",
+            "status": "authenticated"
+        })
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"OAuth callback failed: {str(e)}"
+        )
+
+@app.get("/logout")
+async def logout(request: Request):
+    """Clear authentication session."""
+    session = request.session
+    session.clear()
+    return JSONResponse(content={"message": "Logged out successfully"})
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize Google services on startup."""
-    try:
-        authenticate_google_services()
-        print("✅ Google services initialized successfully!")
-    except Exception as e:
-        print(f"❌ Failed to initialize Google services: {e}")
+    """Initialize FastAPI app on startup."""
+    print("✅ FastAPI app started successfully!")
+    print("🌐 OAuth web flow is ready for authentication")
 
 @app.get("/")
 async def root():
@@ -127,17 +222,20 @@ async def root():
         "message": "Google Drive Integration API",
         "version": "1.0.0",
         "endpoints": {
+            "auth": "GET /auth - Start OAuth authentication",
+            "oauth2callback": "GET /oauth2callback - OAuth callback (handled automatically)",
+            "logout": "GET /logout - Clear authentication",
             "create_doc": "POST /create_doc - Create a Google Document",
             "create_sheet": "POST /create_sheet - Create a Google Sheet"
         }
     }
 
 @app.post("/create_doc")
-async def create_doc(request: DocumentRequest):
+async def create_doc(request: DocumentRequest, http_request: Request):
     """Create a Google Document in Drive."""
     try:
         # Ensure services are authenticated
-        drive_service, docs_service = authenticate_google_services()
+        drive_service, docs_service = authenticate_google_services(http_request)
         
         # 1. Create the Google Doc file in Drive
         file_metadata = {
@@ -159,6 +257,8 @@ async def create_doc(request: DocumentRequest):
             "message": f"Google Document '{request.name}' created successfully!"
         })
         
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, 
@@ -166,11 +266,11 @@ async def create_doc(request: DocumentRequest):
         )
 
 @app.post("/create_sheet")
-async def create_sheet(request: SheetRequest):
+async def create_sheet(request: SheetRequest, http_request: Request):
     """Create a Google Sheet in Drive."""
     try:
         # Ensure services are authenticated
-        drive_service, docs_service = authenticate_google_services()
+        drive_service, docs_service = authenticate_google_services(http_request)
         
         # Create empty Google Sheet
         file_metadata = {
@@ -195,6 +295,8 @@ async def create_sheet(request: SheetRequest):
             "message": f"Google Sheet '{request.name}' created successfully!"
         })
         
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, 
@@ -202,12 +304,14 @@ async def create_sheet(request: SheetRequest):
         )
 
 @app.get("/health")
-async def health_check():
+async def health_check(request: Request):
     """Health check endpoint."""
     try:
         # Test Google services
-        authenticate_google_services()
+        authenticate_google_services(request)
         return {"status": "healthy", "google_services": "connected"}
+    except HTTPException as e:
+        return {"status": "unhealthy", "google_services": "disconnected", "error": e.detail}
     except Exception as e:
         return {"status": "unhealthy", "google_services": "disconnected", "error": str(e)}
 
